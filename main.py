@@ -13,11 +13,13 @@ from datetime import datetime
 import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import tempfile # Added this import for tempfile.NamedTemporaryFile
+import shutil # Added for potential cleanup of cache if needed
 
 # --- LangChain specific imports ---
 # Ensure these are installed via requirements.txt
 from langchain_community.vectorstores import Pinecone as LangChainPinecone
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpointEmbeddings # <--- STEP 1 CHANGE: ADDED HuggingFaceEndpointEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpointEmbeddings # <--- CRITICAL: THIS IMPORT MUST BE PRESENT
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_groq import ChatGroq
@@ -46,7 +48,7 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN") # Renamed from API_AUTH_TOKEN for consisten
 
 # Check for essential environment variables
 if not HF_TOKEN:
-    raise RuntimeError("HF_TOKEN environment variable not set for HuggingFace embeddings.")
+    print("Warning: HF_TOKEN environment variable not set. Endpoint embeddings might fail if used.")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY environment variable not set.")
 if not PINECONE_API_KEY:
@@ -103,20 +105,20 @@ async def startup_event():
 
     # 1. Initialize Embeddings
     try:
-        # Prioritize local model for potentially lower memory spikes than endpoint, or vice-versa based on testing
-        # Using a smaller model for lower memory footprint (384 dimensions)
+        # Prioritize local model, assuming it's pre-downloaded in Dockerfile
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
-            cache_folder="/app/.hf_cache" # <--- STEP 3 CHANGE: Adjusted cache folder
+            cache_folder="/app/.hf_cache" # <--- CRITICAL: Set cache folder to where Dockerfile pre-downloads
         )
         print("✅ Local SentenceTransformer Embeddings initialized successfully.")
     except Exception as e:
         print(f"❌ Error initializing local embeddings: {e}")
         try:
             # Fallback to endpoint embeddings if local fails, requires HF_TOKEN
+            # Pass HF_TOKEN here explicitly if the endpoint requires it.
             embeddings = HuggingFaceEndpointEmbeddings(
-                model="sentence-transformers/all-mpnet-base-v2", # This is 768-dim, if MiniLM-L6-v2 is causing issues, this might be better
-                huggingfacehub_api_token=HF_TOKEN
+                model="sentence-transformers/all-mpnet-base-v2", # This is 768-dim, potentially more memory
+                huggingfacehub_api_token=HF_TOKEN # Use the env var here
             )
             print("✅ Fallback HuggingFace Endpoint Embeddings initialized successfully.")
         except Exception as e2:
@@ -166,9 +168,14 @@ async def startup_event():
             # Load initial "static-policies" for BM25 if needed
             print(f"Attempting to load documents from '{STATIC_DOCS_NAMESPACE}' for BM25...")
             try:
-                global_static_documents_for_bm25 = [] # This will be populated by your ingest_static_documents.py script
+                # For a robust solution, you'd fetch documents from Pinecone here
+                # and pass them to BM25Retriever.from_documents.
+                # Since fetching all documents from Pinecone can be memory/time intensive at startup,
+                # we'll initialize BM25 with an empty list for static docs by default.
+                # It will then learn from documents dynamically ingested per request.
+                global_static_documents_for_bm25 = []
                 global_static_bm25_retriever = BM25Retriever.from_documents(global_static_documents_for_bm25)
-                global_static_bm25_retriever.k = 3 # Default k for static BM25
+                global_static_bm25_retriever.k = 3
                 print("✅ BM25 retriever initialized for static content (will update dynamically).")
             except Exception as e:
                 print(f"⚠️ Could not initialize BM25 for static documents: {e}. Will proceed without it initially for static.")
@@ -224,33 +231,33 @@ class EnhancedAnswerResponse(BaseModel):
 
 # Enhanced Insurance-Specific Prompt Template
 INSURANCE_CLAIM_PROMPT = """
-You are an expert insurance claim processor with deep knowledge of policy terms, coverage rules, and claim evaluation. You must analyze claims systematically and provide structured decisions.
+You are an expert insurance claim processor with deep knowledge of policy terms, coverage rules, and claim evaluation. You must analyze claims systematically and provide structured decisions.<br>
 
-ANALYSIS FRAMEWORK:
-1. **Eligibility Assessment**: Determine if the claim is covered under the policy
-2. **Coverage Limits**: Identify applicable limits, deductibles, and caps
-3. **Coordination of Benefits**: Check for multiple insurance policies and calculate remaining amounts
-4. **Exclusion Review**: Identify any policy exclusions that apply
-5. **Decision Logic**: Apply business rules to determine approval/denial
-6. **Payout Calculation**: Calculate exact amounts considering all factors
+ANALYSIS FRAMEWORK:<br>
+1. **Eligibility Assessment**: Determine if the claim is covered under the policy<br>
+2. **Coverage Limits**: Identify applicable limits, deductibles, and caps<br>
+3. **Coordination of Benefits**: Check for multiple insurance policies and calculate remaining amounts<br>
+4. **Exclusion Review**: Identify any policy exclusions that apply<br>
+5. **Decision Logic**: Apply business rules to determine approval/denial<br>
+6. **Payout Calculation**: Calculate exact amounts considering all factors<br>
 
-RESPONSE FORMAT (Must be valid JSON):
-{{
-    "decision": "[APPROVED/DENIED/PENDING_REVIEW]",
-    "confidence_score": [0.0-1.0],
-    "payout_amount": [amount or null],
-    "reasoning": "Detailed explanation with specific policy references",
-    "policy_sections_referenced": ["section1", "section2"],
-    "exclusions_applied": ["exclusion1", "exclusion2"],
-    "coordination_of_benefits": {{
-        "has_other_insurance": [true/false],
-        "primary_insurance": "name or null",
-        "secondary_insurance": "name or null", 
-        "primary_payment": [amount or null],
-        "remaining_amount": [amount or null]
-    }},
-    "processing_notes": ["note1", "note2"]
-}}
+RESPONSE FORMAT (Must be valid JSON):<br>
+{{<br>
+    "decision": "[APPROVED/DENIED/PENDING_REVIEW]",<br>
+    "confidence_score": [0.0-1.0],<br>
+    "payout_amount": [amount or null],<br>
+    "reasoning": "Detailed explanation with specific policy references",<br>
+    "policy_sections_referenced": ["section1", "section2"],<br>
+    "exclusions_applied": ["exclusion1", "exclusion2"],<br>
+    "coordination_of_benefits": {{<br>
+        "has_other_insurance": [true/false],<br>
+        "primary_insurance": "name or null",<br>
+        "secondary_insurance": "name or null", <br>
+        "primary_payment": [amount or null],<br>
+        "remaining_amount": [amount or null]<br>
+    }},<br>
+    "processing_notes": ["note1", "note2"]<br>
+}}<br>
 
 IMPORTANT RULES:<br>
 - Base decisions ONLY on information in the policy context<br>
@@ -258,14 +265,14 @@ IMPORTANT RULES:<br>
 - Include confidence scores based on clarity of policy language<br>
 - Reference specific policy sections in your reasoning<br>
 - If information is unclear, use "PENDING_REVIEW" decision<br>
-- Strictly adhere to the JSON format. Do not add any text before or after the JSON.
+- Strictly adhere to the JSON format. Do not add any text before or after the JSON.<br>
 
-Policy Context:
-{context}
+Policy Context:<br>
+{context}<br>
 
-Claim Question: {question}
+Claim Question: {question}<br>
 
-Insurance Analysis (JSON format only):
+Insurance Analysis (JSON format only):<br>
 """
 
 # Create the enhanced prompt template
