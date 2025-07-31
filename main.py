@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 # --- LangChain specific imports ---
 # Ensure these are installed via requirements.txt
 from langchain_community.vectorstores import Pinecone as LangChainPinecone
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpointEmbeddings # <--- STEP 1 CHANGE: ADDED HuggingFaceEndpointEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_groq import ChatGroq
@@ -28,9 +28,7 @@ from pinecone import Pinecone, ServerlessSpec # Direct Pinecone client for index
 
 
 # --- Custom Utility Imports ---
-# From your existing utils/document_parser.py, we only need download_file for now
-# chunk_text logic is mostly replicated by LangChain's text_splitter, but keeping the function for explicit use
-from utils.document_parser import download_file, chunk_text # Keep chunk_text if you want your custom chunking
+from utils.document_parser import download_file, chunk_text
 
 # Load environment variables from .env file
 load_dotenv()
@@ -109,7 +107,7 @@ async def startup_event():
         # Using a smaller model for lower memory footprint (384 dimensions)
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
-            cache_folder="/tmp/.cache" # Cache model weights to /tmp for Render
+            cache_folder="/app/.hf_cache" # <--- STEP 3 CHANGE: Adjusted cache folder
         )
         print("✅ Local SentenceTransformer Embeddings initialized successfully.")
     except Exception as e:
@@ -166,23 +164,9 @@ async def startup_event():
             print("✅ LangChain Pinecone vector store initialized.")
 
             # Load initial "static-policies" for BM25 if needed
-            # For this combined approach, 'static-policies' can be pre-ingested via a separate script.
-            # Here, we'll try to fetch all docs from that namespace for BM25 initialization.
-            # NOTE: This can be memory intensive if the static namespace contains MANY documents.
             print(f"Attempting to load documents from '{STATIC_DOCS_NAMESPACE}' for BM25...")
             try:
-                # Query all documents (or a sample) from static namespace to build BM25
-                # This is a simplified way; for very large indices, you'd need batching/streaming.
-                # Or, BM25 would be pre-built and loaded from disk if persistent.
-                temp_docs = []
-                # This might need a more sophisticated way to retrieve ALL docs from a namespace
-                # For now, we assume these are documents ingested via your original ingest_documents.py
-                # You'd need a mechanism to query or list document contents from Pinecone
-                # For a contest, a simple fixed set or a dedicated ingestion method would be used.
-                # As a workaround, we'll initialize BM25 with an empty list and it will be updated by dynamic docs.
-                # If you want to pre-load static docs into BM25, you'd need to fetch them here.
-                # For now, BM25 will learn from dynamically processed docs.
-                global_static_documents_for_bm25 = [] # Will be populated if static ingestion is separate and accessible
+                global_static_documents_for_bm25 = [] # This will be populated by your ingest_static_documents.py script
                 global_static_bm25_retriever = BM25Retriever.from_documents(global_static_documents_for_bm25)
                 global_static_bm25_retriever.k = 3 # Default k for static BM25
                 print("✅ BM25 retriever initialized for static content (will update dynamically).")
@@ -268,12 +252,12 @@ RESPONSE FORMAT (Must be valid JSON):
     "processing_notes": ["note1", "note2"]
 }}
 
-IMPORTANT RULES:
-- Base decisions ONLY on information in the policy context
-- For coordination of benefits, calculate remaining amounts after primary insurance
-- Include confidence scores based on clarity of policy language
-- Reference specific policy sections in your reasoning
-- If information is unclear, use "PENDING_REVIEW" decision
+IMPORTANT RULES:<br>
+- Base decisions ONLY on information in the policy context<br>
+- For coordination of benefits, calculate remaining amounts after primary insurance<br>
+- Include confidence scores based on clarity of policy language<br>
+- Reference specific policy sections in your reasoning<br>
+- If information is unclear, use "PENDING_REVIEW" decision<br>
 - Strictly adhere to the JSON format. Do not add any text before or after the JSON.
 
 Policy Context:
@@ -590,13 +574,13 @@ async def health_check():
         "pinecone_client_ready": pinecone_client_instance is not None,
         "langchain_pinecone_index_ready": langchain_pinecone_index is not None,
         "decision_engine_ready": decision_engine is not None,
-        "static_bm25_retriever_ready": global_static_bm25_retriever is not None
+        "static_bm25_retriever_ready": global_static_bm25_retriever is not None # If you pre-load static BM25
     }
     
     if langchain_pinecone_index:
         try:
-            # Describe index stats from Pinecone
-            stats = await run_in_threadpool(langchain_pinecone_index.describe_index_stats)
+            # Describe index stats from Pinecone via the direct client (as it gives more detail)
+            stats = await run_in_threadpool(pinecone_client_instance.describe_index_stats, index_name=PINECONE_INDEX_NAME)
             status_info["pinecone_stats"] = stats.to_dict()
             status_info["message"] = "Service, LLM, Embeddings, and Pinecone connected."
         except Exception as e:
@@ -715,69 +699,48 @@ async def run_enhanced_query(request: ClaimRequest, token: str = Depends(verify_
                 audit_trail.append(f"Processing question: {question[:50]}...")
                 
                 # --- Hybrid Retrieval ---
-                # We need a retriever that can query both static and dynamic docs.
-                # Pinecone search directly handles namespaces.
-                # BM25 needs the documents locally. We'll combine:
-                # 1. Pinecone search across static and dynamic namespaces.
-                # 2. BM25 search over the *dynamically ingested documents for this request*.
-                # (For static BM25, a pre-built local index or persistent storage would be needed)
-
-                # Vector-based retrieval from Pinecone (combining static and dynamic)
-                # `as_retriever` is configured on the `LangChainPinecone` instance which points to the main index.
-                # We need to explicitly query both namespaces. LangChain's retriever doesn't easily combine namespaces.
-                # So we'll query directly:
-                
-                pinecone_vector_retriever = langchain_pinecone_index.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": 5, "fetch_k": 10} # Get more results to combine later
-                )
-                
                 # Retrieve from static namespace
-                static_relevant_docs = await run_in_threadpool(
-                    pinecone_vector_retriever.get_relevant_documents,
-                    question,
-                    # No explicit namespace option here in LangChain retriever, it's tied to the index.
-                    # This means the retriever will search the default namespace of the index.
-                    # To search multiple namespaces from a single retriever call with LangChain,
-                    # you typically need to create multiple retrievers or do manual indexing.
-                    # For simplicity, we'll rely on one LangChainPinecone instance which defaults to the main index.
-                    # If you need strict namespace separation for retrieval, LangChain needs more setup.
+                # LangChain's .as_retriever() on a Pinecone instance targets its default index/namespace.
+                # To query multiple namespaces or combine, we need to explicitly query each.
 
-                    # Alternative: Manual query for specific namespaces if `as_retriever` doesn't suffice
-                    # results_static = await run_in_threadpool(langchain_pinecone_index.index.query,
-                    #    vector=embeddings.embed_query(question),
-                    #    top_k=3, include_metadata=True, namespace=STATIC_DOCS_NAMESPACE
-                    # )
-                    # static_chunks = [match.metadata['text'] for match in results_static.matches]
+                # First, query the STATIC_DOCS_NAMESPACE
+                results_static_pinecone = await run_in_threadpool(
+                    langchain_pinecone_index.index.query, # Access raw Pinecone index for explicit namespace query
+                    vector=embeddings.embed_query(question), # Embed query using the model
+                    top_k=5,
+                    include_metadata=True,
+                    namespace=STATIC_DOCS_NAMESPACE
                 )
+                static_relevant_docs = [
+                    Document(page_content=match.metadata['text'], metadata={'source': match.metadata.get('source', 'static_pinecone'), 'document_id': match.metadata.get('document_id', 'static_doc')})
+                    for match in results_static_pinecone.matches if 'text' in match.metadata
+                ]
                 
-                # Retrieve from dynamic namespace for this request (if docs were ingested)
+                # Second, query the DYNAMIC_DOC_NAMESPACE (if documents were ingested for this request)
                 dynamic_relevant_docs = []
                 if request_specific_docs: # If there were docs in this request
-                    dynamic_pinecone_vector_retriever = LangChainPinecone(
-                        index_name=PINECONE_INDEX_NAME,
-                        embedding=embeddings,
-                        pinecone_api_key=PINECONE_API_KEY,
-                        namespace=dynamic_doc_namespace # Specify dynamic namespace for this retriever
-                    ).as_retriever(search_kwargs={"k": 3}) # Get fewer from dynamic
-                    dynamic_relevant_docs = await run_in_threadpool(dynamic_pinecone_vector_retriever.get_relevant_documents, question)
+                    results_dynamic_pinecone = await run_in_threadpool(
+                        langchain_pinecone_index.index.query,
+                        vector=embeddings.embed_query(question),
+                        top_k=3,
+                        include_metadata=True,
+                        namespace=dynamic_doc_namespace
+                    )
+                    dynamic_relevant_docs = [
+                        Document(page_content=match.metadata['text'], metadata={'source': match.metadata.get('source', 'dynamic_pinecone'), 'document_id': match.metadata.get('document_id', 'dynamic_doc')})
+                        for match in results_dynamic_pinecone.matches if 'text' in match.metadata
+                    ]
                 
-                # Create a BM25 retriever only for the documents processed in this specific request
+                # Third, create a BM25 retriever only for the documents processed in this specific request
                 # This ensures BM25 works on the most relevant, newly provided context.
-                local_bm25_retriever = None
-                if request_specific_docs:
+                bm25_docs = []
+                if request_specific_docs: # Only create BM25 if there are dynamic documents for this request
                     try:
                         local_bm25_retriever = await run_in_threadpool(BM25Retriever.from_documents, request_specific_docs)
                         local_bm25_retriever.k = 2 # Small k for BM25
-                    except Exception as e:
-                        print(f"⚠️ Failed to create local BM25 for dynamic docs: {e}")
-
-                bm25_docs = []
-                if local_bm25_retriever:
-                    try:
                         bm25_docs = await run_in_threadpool(local_bm25_retriever.get_relevant_documents, question)
                     except Exception as e:
-                        print(f"⚠️ Local BM25 retrieval failed: {e}")
+                        print(f"⚠️ Local BM25 retrieval for dynamic docs failed: {e}")
 
                 # Combine all retrieved documents
                 all_relevant_docs = static_relevant_docs + dynamic_relevant_docs + bm25_docs
@@ -797,6 +760,7 @@ async def run_enhanced_query(request: ClaimRequest, token: str = Depends(verify_
                         question=question,
                         decision="PENDING_REVIEW",
                         confidence_score=0.1,
+                        payout_amount=None,
                         reasoning="No relevant policy information found for this question from any source.",
                         processing_notes=["No relevant documents retrieved from Pinecone or BM25."]
                     ))
@@ -877,9 +841,9 @@ async def run_enhanced_query(request: ClaimRequest, token: str = Depends(verify_
         try:
             if langchain_pinecone_index and dynamic_doc_namespace:
                 print(f"Attempting to delete dynamic document namespace: {dynamic_doc_namespace}")
-                # Pinecone delete is synchronous, run in threadpool
+                # Use direct Pinecone client instance to delete the namespace
                 await run_in_threadpool(
-                    pinecone_client_instance.delete_index, # Use direct client instance to delete namespace
+                    pinecone_client_instance.delete_index,
                     name=PINECONE_INDEX_NAME, # Index name
                     namespace=dynamic_doc_namespace # Namespace to delete
                 )
