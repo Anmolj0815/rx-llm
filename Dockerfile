@@ -1,11 +1,4 @@
-FROM python:3.11-slim-buster
-WORKDIR /app
-COPY requirements.txt .
-
-# Ensure old pinecone-client is removed, then install all dependencies
-RUN pip uninstall -y pinecone-client || true && \
-    pip install --no-cache-dir -r requirements.txt
-
+---
 # --- CRITICAL: Final attempt for robust model pre-download and IndentationError fix ---
 # Set the HuggingFace cache directory within the app's working directory.
 ENV HF_HOME /app/.hf_cache
