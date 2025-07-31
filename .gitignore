@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+env/
+venv/
+*.env
+.vscode/
+
+# Editor-specific files
+.idea/
+*.swp
+*.bak
+*~
+.DS_Store
+
+# Virtual environment
+.venv/
+build/
+dist/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# Logs and other temporary files
+*.log
+*.tmp
+tmp/
+
+# Render deployment specific
+.render/
+
+# HuggingFace cache (models downloaded by sentence-transformers)
+# The default cache folder is ~/.cache/huggingface/hub/
+# If you set cache_folder='/tmp/.cache' in code, it will be ignored by default in /tmp
+# but if it defaults to user's home or project dir, ignore it here.
+.cache/
