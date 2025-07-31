@@ -3,18 +3,17 @@ uvicorn==0.30.1
 python-dotenv==1.0.1
 pypdf==4.2.0
 requests==2.32.3
-# Core LangChain libraries
 langchain==0.2.5
 langchain-community==0.2.5
 langchain-groq==0.1.3
 langchain-huggingface==0.0.3
-langchain-pinecone==0.1.0 # NEW: For Pinecone integration
-# Vector store related
-faiss-cpu==1.8.0 # Keep this if you want FAISS as a local option, but Pinecone is primary
+langchain-pinecone==0.1.0
+faiss-cpu==1.8.0
 pinecone-client>=4.0.0
-# Other dependencies
 pydantic==2.8.2
 typing-extensions==4.12.2
-rank-bm25==0.0.2 # NEW: Required for BM25Retriever
-# For tempfile operations in document_parser
-# No explicit dependency needed as it's built-in
+rank-bm25==0.2.2 # Corrected version
+# Optional: Add specific OCR library if needed
+# google-cloud-vision
+# Optional: For better handling of docx
+# python-docx
